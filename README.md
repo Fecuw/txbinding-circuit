@@ -1,2 +1,2 @@
 # zklogin-circuit
-Circuit repo for zklogins
+Circuit repo for zklogins and txbinding

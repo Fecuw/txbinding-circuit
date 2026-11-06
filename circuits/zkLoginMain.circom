@@ -48,9 +48,8 @@ Private Inputs:
 
     - ext_nonce[maxNonceLength]: The extended nonce claim
     - ext_nonce_length, nonce_index_b64, nonce_length_b64, nonce_colon_index, nonce_value_index
-    - eph_public_key[2]:        The ephemeral public key split into two 128-bit values
-    - max_epoch:                The maximum epoch for which the eph_public_key is valid
-    - jwt_randomness:           A 128-bit random number to keep the sensitive parts of JWT hidden.
+    - jwt_randomness:           A 128-bit random number used as nonce randomness r.
+    - tx_hash:                 Hash(target, value, calldata, executor, chainId, gateway) bound into the JWT nonce
 
     - ext_ev[maxExtEVLength]:   The extended email_verified claim
     - ext_ev_length, ev_index_b64, ev_length_b64, ev_name_length, ev_colon_index, ev_value_index, ev_value_length
@@ -61,7 +60,7 @@ Private Inputs:
     - salt:                     The subject's salt
 
 Signals revealed to the verifier along with the ZK proof:
-    - eph_public_key, max_epoch, address_seed
+    - address_seed
     - iss_b64:                  The base64-encoded extended iss
     - iss_index_in_payload_mod_4: The start index mod 4 of the position at which iss_b64 appears
     - header, modulus
@@ -81,7 +80,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     var inCount = maxPaddedUnsignedJWTLen;
 
     /**
-     1. Parse out the JWT header 
+     1. JWTからheader を取り出す
     **/
     signal input padded_unsigned_jwt[inCount];
     signal input payload_start_index;
@@ -98,7 +97,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     x === 46; // 46 is the ASCII code for '.'
 
     /**
-     2. SHA2 operations over padded_unsigned_jwt
+     2. header.payload の SHA-256 を計算する
         - Check the validity of SHA2 padding
         - Compute SHA2(padded_unsigned_jwt)
     */
@@ -117,7 +116,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     );
 
     /**
-     3. Check signature
+     3. JWTの署名を検証する（RSA）
     **/
     signal input signature[32]; // The JWT signature  
     signal input modulus[32];
@@ -135,7 +134,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     signal modulus_F <== HashToField(64, 32)(modulus_be);
 
     /**
-     4. Checks on extended_key_claim + extract key claim name, value
+     4. emailを取り出す
 
     Note that the OpenID standard permits extended_key_claim to be any valid JSON member. 
     But the below logic is (slightly) more restrictive as it imposes a few length restrictions:
@@ -194,9 +193,9 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     signal kc_value_F <== HashBytesToField(maxKCValueLen)(kc_value);
 
     /**
-     5. Checks on extended_nonce
+     5. nonce を検証する
         a) Is it in the JWT payload? 
-        b) Calculate nonce from public key, epoch, and randomness
+        b) Calculate nonce from randomness and tx_hash
         c) Check that nonce appears in extended_nonce
     **/
     var nonce_name_length = 7;
@@ -235,17 +234,14 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
         nonce_name_with_quotes[i] === expected_nonce_name[i];
     }
 
-    // 5b) Calculate nonce
-    signal input eph_public_key[2];
-    signal input max_epoch;
+    // 5b) Calculate nonce = H(tx_info, r). tx_hash is tx_info and jwt_randomness is r.
     signal input jwt_randomness;
+    signal input tx_hash;
     component size_checker_2 = Num2Bits(128);
     size_checker_2.in <== jwt_randomness; // ensure it is 16 bytes
 
-    signal nonce <== Hasher(4)([
-        eph_public_key[0],
-        eph_public_key[1],
-        max_epoch,
+    signal nonce <== Hasher(2)([
+        tx_hash,
         jwt_randomness
     ]);
 
@@ -256,7 +252,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     );
 
     /**
-    6. Checks on the email_verified claim:
+    6. emailを検証する（ユーザ検証用）
         If the key claim is email, then we check that the value is true.
         Otherwise, it is expected that the nonce string is input so that string parsing routines do not complain.
     **/
@@ -299,7 +295,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     );
 
     /**
-    7. Checks on ext_aud + extract aud
+    7. aud を取り出す（hash検証用）
     **/
 
     var aud_name_length = 3 + 2; // "aud"
@@ -346,7 +342,7 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     signal aud_value_F <== HashBytesToField(maxAudValueLen)(aud_value);
 
     /**
-    8. Reveal the portion of JWT encoding the extended iss claim.
+    8. issを取り出す
        Note that we are revealing a base64 string.
     **/
     signal input iss_index_b64;
@@ -364,29 +360,55 @@ template zkLogin(maxHeaderLen, maxPaddedUnsignedJWTLen,
     iss_index_in_payload_mod_4 = RemainderMod4(numBits(inCount))(iss_index_b64 - payload_start_index);
 
     /**
-    9. Compute the address seed
+    9. address_seed（ユーザのEthereumアドレス） を計算して照合する
     **/
     signal input salt;
+    signal input address_seed;
     signal hashed_salt <== Hasher(1)([salt]);
-    signal address_seed <== Hasher(4)([
+    signal address_seed_actual <== Hasher(4)([
         kc_name_F, kc_value_F, aud_value_F, hashed_salt
     ]);
+    address_seed === address_seed_actual;
 
     /**
-    10. Compress public inputs
+    10. all_inputs_hash（最後の検証用のhash）を作成する（zkloginの仕様として検証することで厳格に改変を検証する）
         We reveal a hash of some signals to the verifier. These signal values
         need to be given to the verifier along with ZK proof.
     **/
     signal input all_inputs_hash;
-    signal all_inputs_hash_actual <== Hasher(8)([
-        eph_public_key[0],
-        eph_public_key[1],
+    signal all_inputs_hash_actual <== Hasher(6)([
         address_seed,
-        max_epoch,
+        tx_hash,
         iss_b64_F,
         iss_index_in_payload_mod_4,
         header_F,
         modulus_F
     ]);
     all_inputs_hash === all_inputs_hash_actual;
+
+    /**
+    11. public inputに入れたhashとjwtの2段hashが一致するかを検証する（これを後で記録してリプレイ防止に使う）
+        jwt_sha2_hash is SHA-256(header.payload), which is also what the RSA
+        signature verification is bound to above.
+    **/
+    signal input jwt_nullifier;
+    signal jwt_nullifier_actual <== Hasher(4)([
+        jwt_sha2_hash[0],
+        jwt_sha2_hash[1],
+        jwt_sha2_hash[2],
+        jwt_sha2_hash[3]
+    ]);
+    jwt_nullifier === jwt_nullifier_actual;
+
+    /**
+    12. 「この proof は prover secret を知る prover が作った」ことを回路内で証明する
+        These legacy signal names represent the prover circuit keypair:
+          - prover_secret: private key held only by the official Prover-server
+          - prover_commitment: public key = Poseidon(private key)
+        The verifier only sees the public key, which must match the registered prover.
+    **/
+    signal input prover_secret;
+    signal input prover_commitment;
+    signal prover_commitment_actual <== Hasher(1)([prover_secret]);
+    prover_commitment === prover_commitment_actual;
 }
